@@ -374,6 +374,7 @@ class ScaleFlowDecoder(nn.Module):
         use_cross_attention: bool = True,
         cross_attention_max_scale: int = 3,
         cross_attention_heads: int = 8,
+        gradient_checkpointing: bool = False,
     ) -> None:
         """Initialize ScaleFlowDecoder.
         
@@ -446,6 +447,16 @@ class ScaleFlowDecoder(nn.Module):
             bias=True,
         )
 
+        self.gradient_checkpointing = gradient_checkpointing
+
+    def enable_gradient_checkpointing(self) -> None:
+        """Enable gradient checkpointing for lower VRAM usage."""
+        self.gradient_checkpointing = True
+
+    def disable_gradient_checkpointing(self) -> None:
+        """Disable gradient checkpointing."""
+        self.gradient_checkpointing = False
+
     def compute_conditioning(
         self,
         e_text: torch.Tensor,
@@ -502,13 +513,24 @@ class ScaleFlowDecoder(nn.Module):
 
         # Pass through ConvNeXt V2 blocks with AdaLN & ScaleAwareCrossAttention
         for block in self.blocks:
-            h = block(
-                h,
-                c,
-                text_sequence=text_sequence,
-                scale=scale,
-                text_mask=text_mask,
-            )
+            if self.gradient_checkpointing and self.training:
+                h = torch.utils.checkpoint.checkpoint(
+                    block,
+                    h,
+                    c,
+                    text_sequence,
+                    scale,
+                    text_mask,
+                    use_reentrant=False,
+                )
+            else:
+                h = block(
+                    h,
+                    c,
+                    text_sequence=text_sequence,
+                    scale=scale,
+                    text_mask=text_mask,
+                )
 
         h = self.final_norm(h)
 

@@ -49,6 +49,7 @@ class ScaleFlowConfig:
     use_cross_attention: bool = True
     cross_attention_max_scale: int = 3
     cross_attention_heads: int = 8
+    gradient_checkpointing: bool = False
 
     def to_dict(self) -> Dict[str, Any]:
         """Convert configuration to dictionary."""
@@ -135,6 +136,7 @@ class ScaleFlowModel(nn.Module):
             use_cross_attention=config.use_cross_attention,
             cross_attention_max_scale=config.cross_attention_max_scale,
             cross_attention_heads=getattr(config, "cross_attention_heads", 8),
+            gradient_checkpointing=getattr(config, "gradient_checkpointing", False),
         )
 
     def encode_text(
@@ -338,6 +340,16 @@ class ScaleFlowModel(nn.Module):
             curr = self.recursive_step(curr, current_scale=s, e_text=e_text)
             pyramid.append(curr)
         return pyramid
+
+    def enable_gradient_checkpointing(self) -> None:
+        """Enable gradient checkpointing in the decoder for ultra low VRAM footprint."""
+        self.decoder.enable_gradient_checkpointing()
+        self.config.gradient_checkpointing = True
+
+    def disable_gradient_checkpointing(self) -> None:
+        """Disable gradient checkpointing."""
+        self.decoder.disable_gradient_checkpointing()
+        self.config.gradient_checkpointing = False
 
     def num_parameters(self, only_trainable: bool = False) -> int:
         """Return total or trainable parameter count.
