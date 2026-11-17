@@ -33,12 +33,6 @@ dependencies = [
 dev = [
     "pytest>=7.0.0",
 ]
-# Install torch with CUDA support (user picks the right CUDA version):
-# pip install scaleflow[cuda121]
-cuda121 = [
-    "torch>=2.0.0+cu121",
-    "torchvision>=0.15.0+cu121",
-]
 
 [project.urls]
 Homepage = "https://github.com/bueormnew/scaleflow"
