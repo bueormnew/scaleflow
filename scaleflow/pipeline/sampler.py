@@ -2,7 +2,8 @@
 Multiscale Flow ODE/Euler sampler for ScaleFlow.
 
 Implements recursive scale-stepping and Flow Matching ODE / Euler numerical
-integration from base noise (8x8) up to high resolution (1024x1024).
+integration from base noise (8x8) up to high resolution (1024x1024),
+supporting both global text conditioning and scale-aware spatial cross-attention.
 """
 
 from typing import Callable, Dict, List, Optional, Tuple, Union
@@ -48,6 +49,10 @@ class MultiscaleFlowSampler:
         scale: int,
         prompt_embeds: torch.Tensor,
         negative_prompt_embeds: Optional[torch.Tensor] = None,
+        text_sequence: Optional[torch.Tensor] = None,
+        negative_text_sequence: Optional[torch.Tensor] = None,
+        text_mask: Optional[torch.Tensor] = None,
+        negative_text_mask: Optional[torch.Tensor] = None,
         guidance_scale: float = 1.0,
         ode_steps: int = 1,
     ) -> torch.Tensor:
@@ -58,6 +63,10 @@ class MultiscaleFlowSampler:
             scale: Current scale index [0..6].
             prompt_embeds: Text conditioning tensor (B, D).
             negative_prompt_embeds: Optional unconditional text conditioning (B, D).
+            text_sequence: Optional token sequence features (B, L, D) for cross-attention.
+            negative_text_sequence: Optional unconditional token sequence features (B, L, D).
+            text_mask: Optional text padding mask (B, L).
+            negative_text_mask: Optional unconditional text padding mask (B, L).
             guidance_scale: Classifier-free guidance weight (>= 1.0).
             ode_steps: Number of Euler ODE sub-steps (default: 1).
             
@@ -71,30 +80,28 @@ class MultiscaleFlowSampler:
         # Case 1: Direct 1-step recursive flow transition (most efficient, standard ScaleFlow)
         if ode_steps <= 1:
             if guidance_scale > 1.0 and negative_prompt_embeds is not None:
-                # Combined batch for conditioned and unconditioned passes
-                combined_x = torch.cat([x, x], dim=0)
-                combined_embeds = torch.cat([prompt_embeds, negative_prompt_embeds], dim=0)
-                
-                # Get scale embedding
-                e_scale = self.model.embed_scale(scale, device=device).to(dtype=dtype)
-                combined_scale = torch.cat([e_scale, e_scale], dim=0)
-                
-                # Run decoder
-                out = self.model.decoder(
-                    combined_x,
-                    e_text=combined_embeds,
-                    e_scale=combined_scale,
-                    upsample=True,
+                out_cond = self.model.recursive_step(
+                    x,
+                    current_scale=scale,
+                    e_text=prompt_embeds,
+                    text_sequence=text_sequence,
+                    text_mask=text_mask,
                 )
-                out_cond, out_uncond = out.chunk(2, dim=0)
+                out_uncond = self.model.recursive_step(
+                    x,
+                    current_scale=scale,
+                    e_text=negative_prompt_embeds,
+                    text_sequence=negative_text_sequence,
+                    text_mask=negative_text_mask,
+                )
                 next_x = out_uncond + guidance_scale * (out_cond - out_uncond)
             else:
-                e_scale = self.model.embed_scale(scale, device=device).to(dtype=dtype)
-                next_x = self.model.decoder(
+                next_x = self.model.recursive_step(
                     x,
+                    current_scale=scale,
                     e_text=prompt_embeds,
-                    e_scale=e_scale,
-                    upsample=True,
+                    text_sequence=text_sequence,
+                    text_mask=text_mask,
                 )
             return torch.clamp(next_x, -1.0, 1.0)
 
@@ -102,27 +109,66 @@ class MultiscaleFlowSampler:
         dt = 1.0 / ode_steps
         curr = x
         for step in range(ode_steps):
-            t_val = step * dt
-            # Model velocity prediction at 1x resolution
             e_scale = self.model.embed_scale(scale, device=device).to(dtype=dtype)
             if guidance_scale > 1.0 and negative_prompt_embeds is not None:
-                v_cond = self.model.decoder(curr, e_text=prompt_embeds, e_scale=e_scale, upsample=False)
-                v_uncond = self.model.decoder(curr, e_text=negative_prompt_embeds, e_scale=e_scale, upsample=False)
+                v_cond = self.model.decoder(
+                    curr,
+                    e_text=prompt_embeds,
+                    e_scale=e_scale,
+                    text_sequence=text_sequence,
+                    scale=scale,
+                    text_mask=text_mask,
+                    upsample=False,
+                )
+                v_uncond = self.model.decoder(
+                    curr,
+                    e_text=negative_prompt_embeds,
+                    e_scale=e_scale,
+                    text_sequence=negative_text_sequence,
+                    scale=scale,
+                    text_mask=negative_text_mask,
+                    upsample=False,
+                )
                 v = v_uncond + guidance_scale * (v_cond - v_uncond)
             else:
-                v = self.model.decoder(curr, e_text=prompt_embeds, e_scale=e_scale, upsample=False)
+                v = self.model.decoder(
+                    curr,
+                    e_text=prompt_embeds,
+                    e_scale=e_scale,
+                    text_sequence=text_sequence,
+                    scale=scale,
+                    text_mask=text_mask,
+                    upsample=False,
+                )
 
             # Euler integration step
             curr = curr + dt * v
 
         # Finally, recursive step to next scale
-        e_scale = self.model.embed_scale(scale, device=device).to(dtype=dtype)
         if guidance_scale > 1.0 and negative_prompt_embeds is not None:
-            out_cond = self.model.decoder(curr, e_text=prompt_embeds, e_scale=e_scale, upsample=True)
-            out_uncond = self.model.decoder(curr, e_text=negative_prompt_embeds, e_scale=e_scale, upsample=True)
+            out_cond = self.model.recursive_step(
+                curr,
+                current_scale=scale,
+                e_text=prompt_embeds,
+                text_sequence=text_sequence,
+                text_mask=text_mask,
+            )
+            out_uncond = self.model.recursive_step(
+                curr,
+                current_scale=scale,
+                e_text=negative_prompt_embeds,
+                text_sequence=negative_text_sequence,
+                text_mask=negative_text_mask,
+            )
             next_x = out_uncond + guidance_scale * (out_cond - out_uncond)
         else:
-            next_x = self.model.decoder(curr, e_text=prompt_embeds, e_scale=e_scale, upsample=True)
+            next_x = self.model.recursive_step(
+                curr,
+                current_scale=scale,
+                e_text=prompt_embeds,
+                text_sequence=text_sequence,
+                text_mask=text_mask,
+            )
 
         return torch.clamp(next_x, -1.0, 1.0)
 
@@ -131,6 +177,10 @@ class MultiscaleFlowSampler:
         self,
         prompt_embeds: torch.Tensor,
         negative_prompt_embeds: Optional[torch.Tensor] = None,
+        text_sequence: Optional[torch.Tensor] = None,
+        negative_text_sequence: Optional[torch.Tensor] = None,
+        text_mask: Optional[torch.Tensor] = None,
+        negative_text_mask: Optional[torch.Tensor] = None,
         steps: int = 7,
         start_scale: int = 0,
         ode_steps_per_scale: int = 1,
@@ -146,6 +196,10 @@ class MultiscaleFlowSampler:
         Args:
             prompt_embeds: Text conditioning tensor of shape (B, D).
             negative_prompt_embeds: Optional unconditional conditioning of shape (B, D).
+            text_sequence: Optional token sequence features (B, L, D).
+            negative_text_sequence: Optional unconditional token sequence features (B, L, D).
+            text_mask: Optional text padding mask (B, L).
+            negative_text_mask: Optional unconditional text padding mask (B, L).
             steps: Number of recursive scale transitions (default: 7 -> 8x8 to 1024x1024).
             start_scale: Scale level index to start from (default: 0).
             ode_steps_per_scale: Euler sub-steps per scale level (default: 1).
@@ -196,6 +250,10 @@ class MultiscaleFlowSampler:
                 scale=scale_level,
                 prompt_embeds=prompt_embeds,
                 negative_prompt_embeds=negative_prompt_embeds,
+                text_sequence=text_sequence,
+                negative_text_sequence=negative_text_sequence,
+                text_mask=text_mask,
+                negative_text_mask=negative_text_mask,
                 guidance_scale=guidance_scale,
                 ode_steps=ode_steps_per_scale,
             )

@@ -23,6 +23,7 @@ from .encoder import (
 from .decoder import (
     GRN,
     ConvNeXtV2AdaLNBlock,
+    ScaleAwareCrossAttention,
     PixelShuffleUpsampler,
     ScaleFlowDecoder,
 )
@@ -45,6 +46,7 @@ __all__ = [
     # Decoder
     "GRN",
     "ConvNeXtV2AdaLNBlock",
+    "ScaleAwareCrossAttention",
     "PixelShuffleUpsampler",
     "ScaleFlowDecoder",
     # Integrated Model

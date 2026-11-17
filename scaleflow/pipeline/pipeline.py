@@ -8,7 +8,7 @@ Provides high-level text-to-image generation:
 """
 
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Dict, List, Optional, Tuple, Union
 import torch
 import torch.nn as nn
 from PIL import Image
@@ -126,15 +126,26 @@ class ScaleFlowPipeline:
     def encode_prompts(
         self,
         prompts: Union[str, List[str]],
-    ) -> torch.Tensor:
-        """Encode text prompt(s) into pooled conditioning vector(s) e_text.
+        return_sequence: bool = True,
+    ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]]:
+        """Encode text prompt(s) into pooled conditioning vector(s) e_text and sequence features.
         
         Args:
             prompts: Single string prompt or list of string prompts.
+            return_sequence: Whether to return sequence features and attention mask.
             
         Returns:
-            Conditioning tensor of shape (B, D) on pipeline device.
+            If return_sequence=False: e_text of shape (B, D).
+            If return_sequence=True: tuple (e_text, text_sequence, attention_mask).
         """
+        if hasattr(self.model, "encode_prompts"):
+            return self.model.encode_prompts(
+                prompts,
+                self.tokenizer,
+                device=self.device,
+                return_sequence=return_sequence,
+            )
+
         if isinstance(prompts, str):
             prompt_list = [prompts]
         else:
@@ -148,10 +159,15 @@ class ScaleFlowPipeline:
             return_tensors="pt",
         )
         input_ids = encoded.input_ids.to(self.device)
-        attention_mask = encoded.attention_mask.to(self.device)
+        attention_mask = encoded.attention_mask.to(self.device) if encoded.attention_mask is not None else None
 
-        # Encode text to e_text (B, D)
-        return self.model.encode_text(input_ids, attention_mask=attention_mask)
+        if return_sequence:
+            e_text, text_seq = self.model.text_encoder(
+                input_ids, attention_mask=attention_mask, return_sequence=True
+            )
+            return e_text, text_seq, attention_mask
+        else:
+            return self.model.encode_text(input_ids, attention_mask=attention_mask)
 
     @torch.no_grad()
     def __call__(
@@ -197,10 +213,13 @@ class ScaleFlowPipeline:
             generator = torch.Generator(device=self.device).manual_seed(seed)
 
         # 1. Encode conditioning
-        prompt_embeds = self.encode_prompts(prompt_list)
+        prompt_embeds, text_sequence, text_mask = self.encode_prompts(prompt_list, return_sequence=True)
 
         # 2. Encode negative conditioning for CFG if enabled
         negative_prompt_embeds = None
+        negative_text_sequence = None
+        negative_text_mask = None
+
         if guidance_scale > 1.0:
             if negative_prompt is None:
                 neg_list = ["" for _ in prompt_list]
@@ -208,12 +227,18 @@ class ScaleFlowPipeline:
                 neg_list = [negative_prompt] * len(prompt_list)
             else:
                 neg_list = list(negative_prompt)
-            negative_prompt_embeds = self.encode_prompts(neg_list)
+            negative_prompt_embeds, negative_text_sequence, negative_text_mask = self.encode_prompts(
+                neg_list, return_sequence=True
+            )
 
         # 3. Run recursive multiscale sampling
         output = self.sampler.sample(
             prompt_embeds=prompt_embeds,
             negative_prompt_embeds=negative_prompt_embeds,
+            text_sequence=text_sequence,
+            negative_text_sequence=negative_text_sequence,
+            text_mask=text_mask,
+            negative_text_mask=negative_text_mask,
             steps=steps,
             guidance_scale=guidance_scale,
             generator=generator,

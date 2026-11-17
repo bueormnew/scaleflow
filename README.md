@@ -1,6 +1,6 @@
 # ScaleFlow: Recursive Multiscale Flow Matching for Image Generation
 
-[![Tests](https://img.shields.io/badge/tests-68%20passed%20%28100%25%29-brightgreen.svg)]()
+[![Tests](https://img.shields.io/badge/tests-72%20passed%20%28100%25%29-brightgreen.svg)]()
 [![Python](https://img.shields.io/badge/python-3.10%2B-blue.svg)]()
 [![PyTorch](https://img.shields.io/badge/PyTorch-2.0%2B-orange.svg)]()
 [![License](https://img.shields.io/badge/license-MIT-purple.svg)]()
@@ -59,12 +59,17 @@ Instead of generating images at full resolution via dozens of flat denoising ste
    - Global Response Normalization (GRN) and GELU activations.
    - Sub-pixel $2\times$ PixelShuffle upsampler head.
 
-5. **Multiscale Optimal Transport Conditional Flow Matching (`scaleflow.training`)**:
+5. **Scale-Aware Cross-Attention (`scaleflow.models.decoder.ScaleAwareCrossAttention`)**:
+   - Multi-head spatial cross-attention between visual feature maps and text token sequences ($L \times D$).
+   - Active only at semantic coarse-to-medium resolutions ($s \le 3$, covering $\le 64 \times 64$) with zero-initialized residual gating.
+   - Completely bypassed with zero compute overhead at high resolutions ($128 \times 128$ to $1024 \times 1024$) where pixel counts dominate.
+
+6. **Multiscale Optimal Transport Conditional Flow Matching (`scaleflow.training`)**:
    - Dynamic downsampled image pyramids.
    - Straight-line probability paths $x_t = (1 - (1 - \sigma_{\min})t)x_0 + t x_1$ with constant target velocity $v_t = x_1 - (1 - \sigma_{\min})x_0$.
    - Scale-conditioned loss weighting and cosine similarity velocity metrics.
 
-6. **High-Level User Pipeline (`scaleflow.pipeline.ScaleFlowPipeline`)**:
+7. **High-Level User Pipeline (`scaleflow.pipeline.ScaleFlowPipeline`)**:
    - Simple Hugging Face-style interface: `.from_pretrained()`, `.to(device)`, and `__call__()`.
    - Native support for PIL images, PyTorch tensors, multiscale pyramids, and CFG.
 
@@ -372,9 +377,9 @@ IA IMAGEN/
 ├── outputs/                    # Sample artifacts and generated test images
 └── tests/                      # Full Test Suite
     ├── test_tokenizer.py       # 12 unit tests for BPE tokenizer
-    ├── test_models.py          # 21 unit tests for encoder, decoder, scale embeddings
+    ├── test_models.py          # 23 unit tests for encoder, decoder, scale embeddings, cross-attention
     ├── test_training.py        # 18 unit tests for OT-CFM, trainer, dataset, losses
-    ├── test_pipeline.py        # 14 unit tests for sampler, pipeline, utilities
+    ├── test_pipeline.py        # 16 unit tests for sampler, pipeline, cross-attention, utilities
     └── test_integration.py     # 3 end-to-end integration tests (Train -> Save -> Load -> Inference)
 ```
 
@@ -395,11 +400,11 @@ python -m unittest discover tests/
 ```
 
 ### Test Coverage Summary:
-- **Total Tests**: `68 passed (100% success)`
+- **Total Tests**: `72 passed (100% success)`
   - `tests/test_tokenizer.py`: 12 tests (BPE training, merges, special tokens, serialization, batch tensors)
-  - `tests/test_models.py`: 21 tests (Scale embeddings, Conv/Attn ratio, AdaLN, GRN, PixelShuffle $8 \to 1024$)
+  - `tests/test_models.py`: 23 tests (Scale embeddings, Conv/Attn ratio, AdaLN, GRN, PixelShuffle $8 \to 1024$, ScaleAwareCrossAttention)
   - `tests/test_training.py`: 18 tests (OT trajectory equations, velocity targets, loss functions, synthetic datasets)
-  - `tests/test_pipeline.py`: 14 tests (Euler flow ODE sampler, seed reproducibility, image grids, pipeline serialization)
+  - `tests/test_pipeline.py`: 16 tests (Euler flow ODE sampler, seed reproducibility, image grids, pipeline serialization, cross-attention CFG)
   - `tests/test_integration.py`: 3 tests (Complete end-to-end lifecycle: train 1 dummy step, save checkpoint, load into pipeline, inference validation, CFG, training resume)
 
 ---

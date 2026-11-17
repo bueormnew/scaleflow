@@ -46,6 +46,9 @@ class ScaleFlowConfig:
     decoder_dim: int = 256
     decoder_depth: int = 4
     decoder_mlp_ratio: float = 4.0
+    use_cross_attention: bool = True
+    cross_attention_max_scale: int = 3
+    cross_attention_heads: int = 8
 
     def to_dict(self) -> Dict[str, Any]:
         """Convert configuration to dictionary."""
@@ -121,6 +124,7 @@ class ScaleFlowModel(nn.Module):
         )
 
         # 3. Recursive Decoder: ConvNeXt V2 with AdaLN conditioned on c = MLP(e_text + e_scale)
+        # and optional ScaleAwareCrossAttention
         self.decoder = ScaleFlowDecoder(
             in_channels=config.in_channels,
             out_channels=config.out_channels,
@@ -128,39 +132,50 @@ class ScaleFlowModel(nn.Module):
             cond_dim=config.text_dim,
             depth=config.decoder_depth,
             mlp_ratio=config.decoder_mlp_ratio,
+            use_cross_attention=config.use_cross_attention,
+            cross_attention_max_scale=config.cross_attention_max_scale,
+            cross_attention_heads=getattr(config, "cross_attention_heads", 8),
         )
 
     def encode_text(
         self,
         input_ids: torch.Tensor,
         attention_mask: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
-        """Encode tokenized text into global pooled embedding e_text.
+        return_sequence: bool = False,
+    ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+        """Encode tokenized text into global pooled embedding e_text (and optional sequence).
         
         Args:
             input_ids: Token ID tensor of shape (B, L).
             attention_mask: Optional mask (B, L) with 1 for valid tokens and 0 for padding.
+            return_sequence: Whether to return sequence features (B, L, D) along with e_text.
             
         Returns:
-            e_text tensor of shape (B, text_dim).
+            e_text tensor of shape (B, text_dim), or tuple of (e_text, seq_features).
         """
-        return self.text_encoder(input_ids, attention_mask=attention_mask)
+        return self.text_encoder(
+            input_ids,
+            attention_mask=attention_mask,
+            return_sequence=return_sequence,
+        )
 
     def encode_prompts(
         self,
         prompts: Union[str, List[str]],
         tokenizer: Any,
         device: Optional[torch.device] = None,
-    ) -> torch.Tensor:
+        return_sequence: bool = False,
+    ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]]:
         """Convenience method to encode raw text string prompt(s) using a tokenizer.
         
         Args:
             prompts: String or list of string prompts.
             tokenizer: BPETokenizer instance (supports batch call returning BatchEncoding).
             device: Optional device to place tensors on.
+            return_sequence: Whether to return sequence features and attention mask.
             
         Returns:
-            e_text tensor of shape (B, text_dim).
+            e_text tensor of shape (B, text_dim) or (e_text, text_sequence, attention_mask).
         """
         if isinstance(prompts, str):
             prompts = [prompts]
@@ -169,6 +184,12 @@ class ScaleFlowModel(nn.Module):
         target_device = device if device is not None else next(self.parameters()).device
         input_ids = batch.input_ids.to(target_device)
         attention_mask = batch.attention_mask.to(target_device) if batch.attention_mask is not None else None
+
+        if return_sequence:
+            e_text, text_sequence = self.encode_text(
+                input_ids, attention_mask=attention_mask, return_sequence=True
+            )
+            return e_text, text_sequence, attention_mask
 
         return self.encode_text(input_ids, attention_mask=attention_mask)
 
@@ -196,6 +217,7 @@ class ScaleFlowModel(nn.Module):
         attention_mask: Optional[torch.Tensor] = None,
         e_text: Optional[torch.Tensor] = None,
         e_scale: Optional[torch.Tensor] = None,
+        text_sequence: Optional[torch.Tensor] = None,
         upsample: bool = True,
     ) -> torch.Tensor:
         """Forward pass through the model.
@@ -207,17 +229,25 @@ class ScaleFlowModel(nn.Module):
             attention_mask: Optional attention mask (B, L).
             e_text: Optional precomputed text embedding of shape (B, text_dim).
             e_scale: Optional precomputed scale embedding of shape (B, text_dim).
+            text_sequence: Optional precomputed text sequence features of shape (B, L, text_dim).
             upsample: If True, outputs 2x resolution image (B, out_channels, 2H, 2W).
                      If False, outputs 1x resolution image (B, out_channels, H, W).
                      
         Returns:
             Output image tensor at 2x (or 1x) resolution.
         """
-        # Resolve e_text
-        if e_text is None:
-            if input_ids is None:
-                raise ValueError("Either e_text or input_ids must be provided to forward().")
-            e_text = self.encode_text(input_ids, attention_mask=attention_mask)
+        # Resolve e_text and text_sequence
+        if input_ids is not None:
+            if e_text is None or (self.config.use_cross_attention and text_sequence is None):
+                e_text_enc, text_seq_enc = self.text_encoder(
+                    input_ids, attention_mask=attention_mask, return_sequence=True
+                )
+                if e_text is None:
+                    e_text = e_text_enc
+                if text_sequence is None:
+                    text_sequence = text_seq_enc
+        elif e_text is None:
+            raise ValueError("Either e_text or input_ids must be provided to forward().")
 
         # Resolve e_scale
         if e_scale is None:
@@ -225,14 +255,24 @@ class ScaleFlowModel(nn.Module):
                 raise ValueError("Either e_scale or scale must be provided to forward().")
             e_scale = self.embed_scale(scale, device=x.device)
 
-        # Pass through recursive decoder
-        return self.decoder(x, e_text=e_text, e_scale=e_scale, upsample=upsample)
+        # Pass through recursive decoder with scale-aware cross-attention
+        return self.decoder(
+            x,
+            e_text=e_text,
+            e_scale=e_scale,
+            text_sequence=text_sequence,
+            scale=scale,
+            text_mask=attention_mask,
+            upsample=upsample,
+        )
 
     def recursive_step(
         self,
         x: torch.Tensor,
         current_scale: int,
         e_text: torch.Tensor,
+        text_sequence: Optional[torch.Tensor] = None,
+        text_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Perform one recursive upsampling step from current_scale to current_scale + 1.
         
@@ -240,17 +280,29 @@ class ScaleFlowModel(nn.Module):
             x: Image tensor at current scale (B, C, H, W).
             current_scale: Integer scale index in [0..6].
             e_text: Text conditioning tensor (B, text_dim).
+            text_sequence: Optional sequence features for cross-attention.
+            text_mask: Optional text padding mask.
             
         Returns:
             Image tensor at 2x resolution (B, C, 2H, 2W).
         """
         e_scale = self.embed_scale(current_scale, device=x.device)
-        return self.decoder(x, e_text=e_text, e_scale=e_scale, upsample=True)
+        return self.decoder(
+            x,
+            e_text=e_text,
+            e_scale=e_scale,
+            text_sequence=text_sequence,
+            scale=current_scale,
+            text_mask=text_mask,
+            upsample=True,
+        )
 
     def generate_pyramid(
         self,
         x_init: torch.Tensor,
         e_text: torch.Tensor,
+        text_sequence: Optional[torch.Tensor] = None,
+        text_mask: Optional[torch.Tensor] = None,
         start_scale: int = 0,
         num_steps: int = 7,
     ) -> List[torch.Tensor]:
@@ -262,6 +314,8 @@ class ScaleFlowModel(nn.Module):
         Args:
             x_init: Initial image tensor (B, C, H, W), e.g. at 8x8.
             e_text: Text conditioning tensor of shape (B, text_dim).
+            text_sequence: Optional text sequence for cross-attention.
+            text_mask: Optional text padding mask.
             start_scale: Starting scale index (0 corresponds to 8x8).
             num_steps: Number of recursive upsampling steps (default: 7 -> up to 1024x1024).
             
@@ -270,6 +324,16 @@ class ScaleFlowModel(nn.Module):
         """
         pyramid = [x_init]
         curr = x_init
+        for s in range(start_scale, start_scale + num_steps):
+            curr = self.recursive_step(
+                curr,
+                current_scale=s,
+                e_text=e_text,
+                text_sequence=text_sequence,
+                text_mask=text_mask,
+            )
+            pyramid.append(curr)
+        return pyramid
         for s in range(start_scale, start_scale + num_steps):
             curr = self.recursive_step(curr, current_scale=s, e_text=e_text)
             pyramid.append(curr)

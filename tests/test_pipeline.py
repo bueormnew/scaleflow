@@ -159,6 +159,52 @@ class TestScaleFlowPipeline(unittest.TestCase):
         pipe = self.pipe.to("cpu")
         self.assertEqual(pipe.device.type, "cpu")
 
+    def test_pipeline_cross_attention_enabled(self):
+        # Configure model with active scale-aware cross-attention
+        config = ScaleFlowConfig(
+            vocab_size=100,
+            text_dim=64,
+            text_depth=2,
+            text_heads=2,
+            decoder_dim=32,
+            decoder_depth=2,
+            use_cross_attention=True,
+            cross_attention_max_scale=2,
+            cross_attention_heads=2,
+        )
+        model = ScaleFlowModel(config)
+        pipe = ScaleFlowPipeline(model=model, tokenizer=self.tokenizer)
+
+        # Generate image through cross-attention pipeline
+        img = pipe("a futuristic city at sunset", steps=3, seed=42)
+        self.assertIsInstance(img, Image.Image)
+        self.assertEqual(img.size, (64, 64))
+
+    def test_pipeline_cfg_with_cross_attention(self):
+        # Test CFG with different length positive and negative prompts under cross-attention
+        config = ScaleFlowConfig(
+            vocab_size=100,
+            text_dim=64,
+            text_depth=2,
+            text_heads=2,
+            decoder_dim=32,
+            decoder_depth=2,
+            use_cross_attention=True,
+            cross_attention_max_scale=2,
+        )
+        model = ScaleFlowModel(config)
+        pipe = ScaleFlowPipeline(model=model, tokenizer=self.tokenizer)
+
+        img = pipe(
+            prompt="a futuristic city at sunset",
+            negative_prompt="blurry",
+            guidance_scale=2.0,
+            steps=2,
+            seed=101,
+        )
+        self.assertIsInstance(img, Image.Image)
+        self.assertEqual(img.size, (32, 32))
+
     def test_save_and_from_pretrained(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             save_dir = Path(tmpdir) / "test_checkpoint"

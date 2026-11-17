@@ -29,6 +29,7 @@ from scaleflow.models.encoder import (
 from scaleflow.models.decoder import (
     GRN,
     ConvNeXtV2AdaLNBlock,
+    ScaleAwareCrossAttention,
     PixelShuffleUpsampler,
     ScaleFlowDecoder,
 )
@@ -214,6 +215,35 @@ class TestScaleFlowDecoder(unittest.TestCase):
         out = self.decoder(x, e_text=e_text, e_scale=e_scale, upsample=False)
         self.assertEqual(out.shape, (2, 3, 32, 32))
 
+    def test_scale_aware_cross_attention_block(self):
+        """Verify ScaleAwareCrossAttention behavior across scale threshold."""
+        cross_attn = ScaleAwareCrossAttention(
+            dim=self.hidden_dim,
+            context_dim=self.cond_dim,
+            num_heads=4,
+            cross_attention_max_scale=3,
+        )
+        x = torch.randn(2, self.hidden_dim, 16, 16)
+        text_seq = torch.randn(2, 8, self.cond_dim)
+
+        # 1. At scale 2 (<= 3): active, but gate=0 initially -> returns x
+        out_init = cross_attn(x, text_sequence=text_seq, scale=2)
+        torch.testing.assert_close(out_init, x)
+
+        # Set gate to non-zero -> output differs
+        cross_attn.gate.data.fill_(1.0)
+        out_active = cross_attn(x, text_sequence=text_seq, scale=2)
+        self.assertEqual(out_active.shape, x.shape)
+        self.assertFalse(torch.allclose(out_active, x))
+
+        # 2. At scale 4 (> 3): completely bypassed with 0 compute -> returns x unchanged
+        out_bypassed = cross_attn(x, text_sequence=text_seq, scale=4)
+        torch.testing.assert_close(out_bypassed, x)
+
+        # 3. If text_sequence is None: returns x unchanged
+        out_none = cross_attn(x, text_sequence=None, scale=1)
+        torch.testing.assert_close(out_none, x)
+
 
 class TestScaleFlowModel(unittest.TestCase):
     """Test integrated ScaleFlowModel."""
@@ -291,6 +321,29 @@ class TestScaleFlowModel(unittest.TestCase):
         e_text = self.model.encode_prompts(["a photo of a cat", "mountain view"], tokenizer=tokenizer)
         self.assertEqual(e_text.shape, (2, self.config.text_dim))
         self.assertFalse(torch.isnan(e_text).any())
+
+    def test_cross_attention_forward_and_pyramid(self):
+        """Verify model forward pass and pyramid generation with cross-attention enabled."""
+        B = 2
+        x = torch.randn(B, 3, 8, 8)
+        input_ids = torch.randint(0, self.config.vocab_size, (B, 8))
+        
+        # Forward with tokens automatically computes both e_text and text_sequence
+        out = self.model(x, scale=0, input_ids=input_ids, upsample=True)
+        self.assertEqual(out.shape, (B, 3, 16, 16))
+        self.assertFalse(torch.isnan(out).any())
+
+        # Forward with explicit text_sequence
+        e_text, seq = self.model.encode_text(input_ids, return_sequence=True)
+        out_explicit = self.model(x, scale=0, e_text=e_text, text_sequence=seq, upsample=True)
+        self.assertEqual(out_explicit.shape, (B, 3, 16, 16))
+
+        # Full pyramid with text_sequence
+        pyramid = self.model.generate_pyramid(
+            x[:1], e_text=e_text[:1], text_sequence=seq[:1], start_scale=0, num_steps=7
+        )
+        self.assertEqual(len(pyramid), 8)
+        self.assertEqual(pyramid[-1].shape, (1, 3, 1024, 1024))
 
     def test_save_and_load_pretrained(self):
         """Verify .save_pretrained() and .from_pretrained() round-trip."""

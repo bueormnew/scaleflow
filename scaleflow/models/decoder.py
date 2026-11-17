@@ -1,9 +1,12 @@
-"""Recursive ScaleFlowDecoder using ConvNeXt V2 blocks with AdaLN and PixelShuffle.
+"""Recursive ScaleFlowDecoder using ConvNeXt V2 blocks with AdaLN, PixelShuffle,
+and ScaleAwareCrossAttention.
 
 Features:
 - ConvNeXt V2 blocks with 7x7 Depthwise convolutions.
 - AdaLN (Adaptive Layer Normalization) conditioned on c = MLP(e_text + e_scale).
 - Pointwise 1x1 convs, GELU, and GRN (Global Response Normalization).
+- ScaleAwareCrossAttention: Multi-head spatial cross-attention between visual queries
+  and text tokens for early scales (<= 64x64), bypassed with 0 compute at high scales.
 - PixelShuffle(2x) upsampler head producing RGB image at 2x resolution.
 """
 
@@ -11,6 +14,8 @@ from typing import Optional, Tuple, Union
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+
+from .scale_embed import resolution_to_scale
 
 
 class GRN(nn.Module):
@@ -49,8 +54,118 @@ class GRN(nn.Module):
         return self.gamma * (x * nx) + self.beta + x
 
 
+class ScaleAwareCrossAttention(nn.Module):
+    """Scale-aware multi-head cross-attention between visual queries and text keys/values.
+    
+    Conditioned on scale index s and cross_attention_max_scale (default 3, covering <= 64x64).
+    - If s <= cross_attention_max_scale: executes spatial cross-attention with zero-initialized residual gate.
+    - If s > cross_attention_max_scale (128 to 1024): completely bypassed with 0 extra compute.
+    - If text_sequence is None: bypasses cleanly for backward compatibility.
+    """
+
+    def __init__(
+        self,
+        dim: int,
+        context_dim: int,
+        num_heads: int = 8,
+        cross_attention_max_scale: int = 3,
+        dropout: float = 0.0,
+    ) -> None:
+        """Initialize ScaleAwareCrossAttention.
+        
+        Args:
+            dim: Visual feature channels.
+            context_dim: Text feature channels (d_model).
+            num_heads: Number of attention heads.
+            cross_attention_max_scale: Maximum scale index for which cross-attention is executed (default: 3, <= 64x64).
+            dropout: Attention dropout probability.
+        """
+        super().__init__()
+        self.dim = dim
+        self.context_dim = context_dim
+        self.num_heads = num_heads
+        self.cross_attention_max_scale = cross_attention_max_scale
+
+        self.norm = nn.LayerNorm(dim)
+        self.attn = nn.MultiheadAttention(
+            embed_dim=dim,
+            kdim=context_dim,
+            vdim=context_dim,
+            num_heads=num_heads,
+            dropout=dropout,
+            batch_first=True,
+        )
+        # Zero-initialized residual gate (gate * attn_out)
+        self.gate = nn.Parameter(torch.zeros(1))
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        text_sequence: Optional[torch.Tensor] = None,
+        scale: Optional[Union[int, float, torch.Tensor]] = None,
+        text_mask: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """Forward pass.
+        
+        Args:
+            x: Visual feature map of shape (B, C, H, W).
+            text_sequence: Text token features of shape (B, L, D), or None.
+            scale: Scale level index [0..7] (or continuous scale). If None, inferred from resolution.
+            text_mask: Optional attention mask (B, L) where 1 indicates valid token and 0 indicates pad.
+            
+        Returns:
+            Updated visual feature map of shape (B, C, H, W).
+        """
+        # Backward compatibility: if text_sequence is None, bypass cleanly
+        if text_sequence is None:
+            return x
+
+        # Check scale condition
+        if scale is not None:
+            if isinstance(scale, torch.Tensor):
+                current_scale = int(scale.reshape(-1)[0].item())
+            else:
+                current_scale = int(scale)
+        else:
+            # Infer from spatial resolution
+            current_scale = resolution_to_scale(max(x.shape[-2], x.shape[-1]))
+
+        # If s > cross_attention_max_scale (e.g. 128 to 1024), completely bypassed with 0 extra compute
+        if current_scale > self.cross_attention_max_scale:
+            return x
+
+        B, C, H, W = x.shape
+        residual = x
+
+        # Reshape visual queries to (B, H*W, C)
+        q = x.permute(0, 2, 3, 1).reshape(B, H * W, C)
+        q_norm = self.norm(q)
+
+        # Prepare key_padding_mask: True for padding positions
+        key_padding_mask = None
+        if text_mask is not None:
+            if text_mask.dtype == torch.bool:
+                key_padding_mask = ~text_mask
+            else:
+                key_padding_mask = (text_mask == 0)
+
+        # Multi-head cross-attention
+        attn_out, _ = self.attn(
+            query=q_norm,
+            key=text_sequence,
+            value=text_sequence,
+            key_padding_mask=key_padding_mask,
+            need_weights=False,
+        )
+
+        # Reshape back to (B, C, H, W)
+        attn_out = attn_out.reshape(B, H, W, C).permute(0, 3, 1, 2)
+
+        return residual + self.gate * attn_out
+
+
 class ConvNeXtV2AdaLNBlock(nn.Module):
-    """ConvNeXt V2 block with AdaLN (Adaptive Layer Normalization).
+    """ConvNeXt V2 block with AdaLN (Adaptive Layer Normalization) and ScaleAwareCrossAttention.
     
     1. 7x7 Depthwise Conv2d
     2. Channels-last permutation (B, C, H, W) -> (B, H, W, C)
@@ -61,6 +176,7 @@ class ConvNeXtV2AdaLNBlock(nn.Module):
     7. Pointwise Linear (4*dim -> dim)
     8. Gated residual connection
     9. Permutation back to (B, C, H, W)
+    10. ScaleAwareCrossAttention (if enabled and scale <= max_scale)
     """
 
     def __init__(
@@ -69,6 +185,9 @@ class ConvNeXtV2AdaLNBlock(nn.Module):
         cond_dim: int,
         mlp_ratio: float = 4.0,
         grn_eps: float = 1e-6,
+        use_cross_attention: bool = False,
+        cross_attention_max_scale: int = 3,
+        num_heads: int = 8,
     ) -> None:
         """Initialize ConvNeXtV2AdaLNBlock.
         
@@ -77,6 +196,9 @@ class ConvNeXtV2AdaLNBlock(nn.Module):
             cond_dim: Dimension of conditioning vector c.
             mlp_ratio: Multiplier for hidden dimension in FFN.
             grn_eps: Epsilon for GRN.
+            use_cross_attention: Whether to include ScaleAwareCrossAttention.
+            cross_attention_max_scale: Maximum scale for cross-attention.
+            num_heads: Number of attention heads for cross-attention.
         """
         super().__init__()
         self.dim = dim
@@ -111,12 +233,33 @@ class ConvNeXtV2AdaLNBlock(nn.Module):
         self.grn = GRN(hidden_dim, eps=grn_eps)
         self.pwconv2 = nn.Linear(hidden_dim, dim)
 
-    def forward(self, x: torch.Tensor, c: torch.Tensor) -> torch.Tensor:
+        # Scale-aware cross-attention
+        if use_cross_attention:
+            self.cross_attn = ScaleAwareCrossAttention(
+                dim=dim,
+                context_dim=cond_dim,
+                num_heads=num_heads,
+                cross_attention_max_scale=cross_attention_max_scale,
+            )
+        else:
+            self.cross_attn = None
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        c: torch.Tensor,
+        text_sequence: Optional[torch.Tensor] = None,
+        scale: Optional[Union[int, float, torch.Tensor]] = None,
+        text_mask: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
         """Forward pass.
         
         Args:
             x: Feature map tensor of shape (B, C, H, W).
             c: Conditioning tensor of shape (B, cond_dim).
+            text_sequence: Optional text sequence tensor (B, L, D).
+            scale: Optional scale level index [0..7].
+            text_mask: Optional text padding mask.
             
         Returns:
             Output feature map of shape (B, C, H, W).
@@ -132,13 +275,13 @@ class ConvNeXtV2AdaLNBlock(nn.Module):
         # 3. AdaLN modulation
         # ada_proj produces (B, 3 * dim)
         ada_params = self.ada_proj(c)  # (B, 3 * dim)
-        scale, shift, gate = ada_params.chunk(3, dim=-1)
-        scale = scale.unsqueeze(1).unsqueeze(1)  # (B, 1, 1, dim)
-        shift = shift.unsqueeze(1).unsqueeze(1)  # (B, 1, 1, dim)
-        gate = gate.unsqueeze(1).unsqueeze(1)    # (B, 1, 1, dim)
+        scale_mod, shift_mod, gate_mod = ada_params.chunk(3, dim=-1)
+        scale_mod = scale_mod.unsqueeze(1).unsqueeze(1)  # (B, 1, 1, dim)
+        shift_mod = shift_mod.unsqueeze(1).unsqueeze(1)  # (B, 1, 1, dim)
+        gate_mod = gate_mod.unsqueeze(1).unsqueeze(1)    # (B, 1, 1, dim)
 
         x = self.norm(x)
-        x = x * (1.0 + scale) + shift
+        x = x * (1.0 + scale_mod) + shift_mod
 
         # 4. Pointwise conv1
         x = self.pwconv1(x)
@@ -156,8 +299,19 @@ class ConvNeXtV2AdaLNBlock(nn.Module):
         x = x.permute(0, 3, 1, 2)
 
         # Gated residual: (B, C, 1, 1) gate
-        gate = gate.permute(0, 3, 1, 2)
-        return residual + gate * x
+        gate_mod = gate_mod.permute(0, 3, 1, 2)
+        x = residual + gate_mod * x
+
+        # 9. Spatial cross-attention (if configured)
+        if self.cross_attn is not None:
+            x = self.cross_attn(
+                x,
+                text_sequence=text_sequence,
+                scale=scale,
+                text_mask=text_mask,
+            )
+
+        return x
 
 
 class PixelShuffleUpsampler(nn.Module):
@@ -217,6 +371,9 @@ class ScaleFlowDecoder(nn.Module):
         cond_dim: int = 512,
         depth: int = 4,
         mlp_ratio: float = 4.0,
+        use_cross_attention: bool = True,
+        cross_attention_max_scale: int = 3,
+        cross_attention_heads: int = 8,
     ) -> None:
         """Initialize ScaleFlowDecoder.
         
@@ -227,6 +384,9 @@ class ScaleFlowDecoder(nn.Module):
             cond_dim: Dimension of text and scale embeddings.
             depth: Number of ConvNeXt V2 blocks.
             mlp_ratio: FFN expansion ratio in ConvNeXt V2 blocks.
+            use_cross_attention: Whether to use ScaleAwareCrossAttention in blocks.
+            cross_attention_max_scale: Maximum scale for cross-attention execution (default: 3).
+            cross_attention_heads: Attention heads for cross-attention.
         """
         super().__init__()
         self.in_channels = in_channels
@@ -234,6 +394,9 @@ class ScaleFlowDecoder(nn.Module):
         self.hidden_dim = hidden_dim
         self.cond_dim = cond_dim
         self.depth = depth
+        self.use_cross_attention = use_cross_attention
+        self.cross_attention_max_scale = cross_attention_max_scale
+        self.cross_attention_heads = cross_attention_heads
 
         # Conditioning MLP: c = MLP(e_text + e_scale)
         self.cond_mlp = nn.Sequential(
@@ -251,12 +414,15 @@ class ScaleFlowDecoder(nn.Module):
             bias=True,
         )
 
-        # ConvNeXt V2 blocks with AdaLN
+        # ConvNeXt V2 blocks with AdaLN and optional ScaleAwareCrossAttention
         self.blocks = nn.ModuleList([
             ConvNeXtV2AdaLNBlock(
                 dim=hidden_dim,
                 cond_dim=cond_dim,
                 mlp_ratio=mlp_ratio,
+                use_cross_attention=use_cross_attention,
+                cross_attention_max_scale=cross_attention_max_scale,
+                num_heads=cross_attention_heads,
             )
             for _ in range(depth)
         ])
@@ -308,6 +474,9 @@ class ScaleFlowDecoder(nn.Module):
         x: torch.Tensor,
         e_text: torch.Tensor,
         e_scale: torch.Tensor,
+        text_sequence: Optional[torch.Tensor] = None,
+        scale: Optional[Union[int, float, torch.Tensor]] = None,
+        text_mask: Optional[torch.Tensor] = None,
         upsample: bool = True,
     ) -> torch.Tensor:
         """Forward pass.
@@ -316,6 +485,9 @@ class ScaleFlowDecoder(nn.Module):
             x: Input image/latent tensor of shape (B, in_channels, H, W).
             e_text: Text embedding of shape (B, cond_dim).
             e_scale: Scale embedding of shape (B, cond_dim).
+            text_sequence: Optional text sequence features of shape (B, L, D).
+            scale: Optional scale level index [0..7].
+            text_mask: Optional text padding mask.
             upsample: If True, uses PixelShuffle(2x) upsampler to output (B, out_channels, 2H, 2W).
                      If False, outputs at same resolution (B, out_channels, H, W).
                      
@@ -328,9 +500,15 @@ class ScaleFlowDecoder(nn.Module):
         # Project input image to feature space
         h = self.in_proj(x)
 
-        # Pass through ConvNeXt V2 blocks with AdaLN
+        # Pass through ConvNeXt V2 blocks with AdaLN & ScaleAwareCrossAttention
         for block in self.blocks:
-            h = block(h, c)
+            h = block(
+                h,
+                c,
+                text_sequence=text_sequence,
+                scale=scale,
+                text_mask=text_mask,
+            )
 
         h = self.final_norm(h)
 
@@ -338,5 +516,7 @@ class ScaleFlowDecoder(nn.Module):
             out = self.upsampler(h)
         else:
             out = self.direct_head(h)
+
+        return out
 
         return out
