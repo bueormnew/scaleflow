@@ -1,0 +1,17 @@
+Metadata-Version: 2.4
+Name: scaleflow
+Version: 0.1.0
+Summary: Recursive Multiscale Flow Matching for Image Generation
+Author: ScaleFlow Team
+License: MIT
+Requires-Python: >=3.9
+Description-Content-Type: text/markdown
+Requires-Dist: torch>=2.0.0
+Requires-Dist: torchvision>=0.15.0
+Requires-Dist: pillow>=9.0.0
+Provides-Extra: dev
+Requires-Dist: pytest>=7.0.0; extra == "dev"
+
+# ScaleFlow: Recursive Multiscale Flow Matching for Image Generation
+
+A lightweight, ultrafast text-to-image library implementing recursive multiscale Flow Matching.
