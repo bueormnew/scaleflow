@@ -287,6 +287,21 @@ class BPETokenizer:
         self.id_to_token = {v: k for k, v in self.vocab.items()}
         return self
 
+    def train_from_corpus(
+        self,
+        texts: Sequence[str],
+        vocab_size: int,
+        min_frequency: int = 1,
+        verbose: bool = False,
+    ) -> "BPETokenizer":
+        """Convenience alias for train()."""
+        return self.train(
+            texts=texts,
+            vocab_size=vocab_size,
+            min_freq=min_frequency,
+            verbose=verbose,
+        )
+
     def _bpe_chunk(self, chunk: str) -> Tuple[str, ...]:
         """
         Applies learned BPE merge rules to a single pre-tokenized chunk.
