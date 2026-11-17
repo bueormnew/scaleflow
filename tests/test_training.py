@@ -475,6 +475,39 @@ class TestScaleFlowTrainer(unittest.TestCase):
             f"Expected loss to decrease: initial {initial_loss:.4f} vs final {final_loss:.4f}",
         )
 
+    def test_device_selection_and_gpu_config(self):
+        """Verify device selection logic, config options, and graceful fallbacks."""
+        from scaleflow.training.trainer import resolve_device, get_device_info
+
+        # 1. Test explicit device resolution
+        cpu_dev = resolve_device("cpu")
+        self.assertEqual(cpu_dev.type, "cpu")
+
+        auto_dev = resolve_device(None)
+        self.assertIn(auto_dev.type, ("cuda", "mps", "cpu"))
+
+        # 2. Test device info reporting
+        info = get_device_info(cpu_dev)
+        self.assertIn("device_type", info)
+        self.assertEqual(info["device_type"], "cpu")
+
+        # 3. Test TrainerConfig device, AMP, and DataParallel defaults
+        cfg = TrainerConfig(device="cpu", mixed_precision=True, dataparallel=True)
+        self.assertEqual(cfg.device, "cpu")
+        self.assertTrue(cfg.mixed_precision)
+        self.assertTrue(cfg.dataparallel)
+
+        # 4. Instantiate trainer on CPU: mixed_precision and dataparallel should degrade gracefully
+        trainer = ScaleFlowTrainer(
+            model=self.model,
+            flow_matcher=self.flow_matcher,
+            train_dataloader=self.train_loader,
+            config=cfg,
+        )
+        self.assertEqual(trainer.device.type, "cpu")
+        self.assertFalse(trainer._amp_enabled)  # disabled on CPU safely
+        self.assertIsNone(trainer._scaler)
+
 
 if __name__ == "__main__":
     unittest.main()

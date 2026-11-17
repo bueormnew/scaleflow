@@ -13,5 +13,8 @@
   "out_channels": 3,
   "decoder_dim": 64,
   "decoder_depth": 3,
-  "decoder_mlp_ratio": 2.0
+  "decoder_mlp_ratio": 2.0,
+  "use_cross_attention": true,
+  "cross_attention_max_scale": 3,
+  "cross_attention_heads": 8
 }

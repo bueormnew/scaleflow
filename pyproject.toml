@@ -7,9 +7,22 @@ name = "scaleflow"
 version = "0.1.0"
 description = "Recursive Multiscale Flow Matching for Image Generation"
 readme = "README.md"
-authors = [{ name = "ScaleFlow Team" }]
-license = { text = "MIT" }
+authors = [{ name = "ScaleFlow Contributors" }]
+license = { file = "LICENSE" }
 requires-python = ">=3.9"
+keywords = ["image-generation", "flow-matching", "diffusion", "multiscale", "pytorch"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: Apache Software License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Topic :: Scientific/Engineering :: Image Processing",
+]
 dependencies = [
     "torch>=2.0.0",
     "torchvision>=0.15.0",
@@ -20,6 +33,17 @@ dependencies = [
 dev = [
     "pytest>=7.0.0",
 ]
+# Install torch with CUDA support (user picks the right CUDA version):
+# pip install scaleflow[cuda121]
+cuda121 = [
+    "torch>=2.0.0+cu121",
+    "torchvision>=0.15.0+cu121",
+]
+
+[project.urls]
+Homepage = "https://github.com/bueormnew/scaleflow"
+Repository = "https://github.com/bueormnew/scaleflow"
+"Bug Tracker" = "https://github.com/bueormnew/scaleflow/issues"
 
 [tool.setuptools.packages.find]
 where = ["."]

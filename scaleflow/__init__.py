@@ -27,10 +27,13 @@ from scaleflow.training import (
     TrainerConfig,
     MultiscaleOTFlowMatching,
     SyntheticImageTextDataset,
+    resolve_device,
+    get_device_info,
 )
 
 __all__ = [
     "__version__",
+    # Pipeline / Inference
     "ScaleFlowPipeline",
     "MultiscaleFlowSampler",
     "EulerFlowSampler",
@@ -39,14 +42,20 @@ __all__ = [
     "pil_to_tensor",
     "make_image_grid",
     "save_image",
+    # Models
     "ScaleFlowModel",
     "ScaleFlowConfig",
     "ScaleFlowDecoder",
     "HybridTextEncoder",
     "SinusoidalScaleEmbedding",
+    # Tokenizer
     "BPETokenizer",
+    # Training
     "ScaleFlowTrainer",
     "TrainerConfig",
     "MultiscaleOTFlowMatching",
     "SyntheticImageTextDataset",
+    # Device utilities
+    "resolve_device",
+    "get_device_info",
 ]

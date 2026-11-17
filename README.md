@@ -1,9 +1,9 @@
 # ScaleFlow: Recursive Multiscale Flow Matching for Image Generation
 
-[![Tests](https://img.shields.io/badge/tests-72%20passed%20%28100%25%29-brightgreen.svg)]()
-[![Python](https://img.shields.io/badge/python-3.10%2B-blue.svg)]()
+[![Tests](https://img.shields.io/badge/tests-73%20passed%20%28100%25%29-brightgreen.svg)]()
+[![Python](https://img.shields.io/badge/python-3.9%2B-blue.svg)]()
 [![PyTorch](https://img.shields.io/badge/PyTorch-2.0%2B-orange.svg)]()
-[![License](https://img.shields.io/badge/license-MIT-purple.svg)]()
+[![License](https://img.shields.io/badge/license-Apache%202.0-blue.svg)](LICENSE)
 
 **ScaleFlow** is a modern, modular, and lightning-fast deep learning library implementing **Recursive Multiscale Optimal Transport Conditional Flow Matching (OT-CFM)** for text-to-image synthesis in PyTorch.
 
@@ -122,24 +122,88 @@ Primary Textures   Fine Details      Photorealism       Ultra-High Definition
 
 ## Installation
 
-### Prerequisites
-- Python 3.10 or higher
-- PyTorch $\ge 2.0.0$
-- torchvision $\ge 0.15.0$
-- Pillow $\ge 9.0.0$
-- NumPy $\ge 1.20.0$
-
-### Install from Source
+### Direct Install via pip from GitHub
 
 ```bash
-git clone https://github.com/your-org/scaleflow.git
-cd "IA IMAGEN"
+pip install git+https://github.com/bueormnew/scaleflow.git
+```
+
+### Install from Source (Editable Mode)
+
+```bash
+git clone https://github.com/bueormnew/scaleflow.git
+cd scaleflow
 pip install -e .
 ```
 
-To install development and testing dependencies:
+To install with development and testing dependencies:
 ```bash
 pip install -e ".[dev]"
+```
+
+---
+
+## Hardware Acceleration: GPU vs CPU Configuration
+
+ScaleFlow supports dynamic compute selection (**CUDA**, **Apple MPS**, or **CPU**) for both inference and training, with **zero changes to the underlying neural architecture**.
+
+### 1. In Training (`ScaleFlowTrainer` & `TrainerConfig`)
+
+You can control hardware and parallel execution directly via `TrainerConfig`:
+
+```python
+from scaleflow.training import TrainerConfig, ScaleFlowTrainer
+
+# Option A: Automatic detection (CUDA if available > Apple MPS > CPU)
+config = TrainerConfig(
+    max_steps=1000,
+    device=None,  # Auto-selects CUDA > MPS > CPU
+)
+
+# Option B: High-Performance GPU Training with AMP & Multi-GPU
+config = TrainerConfig(
+    device="cuda",              # Force CUDA
+    mixed_precision=True,       # Enable AMP (Automatic Mixed Precision via float16)
+    dataparallel=True,          # Real Multi-GPU parallelism via torch.nn.DataParallel
+    dataparallel_device_ids=[0, 1],  # Specify GPU IDs (optional)
+)
+
+# Option C: Explicit CPU Training (e.g. for CI/CD or lightweight local testing)
+config = TrainerConfig(
+    device="cpu",               # Run on CPU
+    mixed_precision=False,
+)
+
+trainer = ScaleFlowTrainer(
+    model=model,
+    flow_matcher=flow_matcher,
+    train_dataloader=train_loader,
+    config=config,
+)
+trainer.train()
+```
+
+### 2. In Inference (`ScaleFlowPipeline`)
+
+Pipelines follow standard PyTorch `.to(device)` conventions:
+
+```python
+from scaleflow.pipeline import ScaleFlowPipeline
+import torch
+
+# Load from pretrained checkpoint
+pipe = ScaleFlowPipeline.from_pretrained("outputs/demo_checkpoint")
+
+# Run on GPU (CUDA)
+if torch.cuda.is_available():
+    pipe = pipe.to("cuda")
+
+# Or run on CPU
+pipe = pipe.to("cpu")
+
+# Generate
+image = pipe("A glowing neon lotus flower floating on dark water", steps=7)
+image.save("lotus.png")
 ```
 
 ---
@@ -411,4 +475,4 @@ python -m unittest discover tests/
 
 ## License
 
-This project is licensed under the MIT License. See [LICENSE](LICENSE) for details.
+This project is licensed under the Apache License 2.0. See the [LICENSE](LICENSE) file for complete details.

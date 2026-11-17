@@ -24,6 +24,8 @@ from .trainer import (
     TrainerConfig,
     get_cosine_schedule_with_warmup,
     get_linear_schedule_with_warmup,
+    resolve_device,
+    get_device_info,
 )
 
 __all__ = [
@@ -44,4 +46,6 @@ __all__ = [
     "TrainerConfig",
     "get_cosine_schedule_with_warmup",
     "get_linear_schedule_with_warmup",
+    "resolve_device",
+    "get_device_info",
 ]
