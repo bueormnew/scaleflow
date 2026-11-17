@@ -1,3 +1,4 @@
+LICENSE
 README.md
 pyproject.toml
 scaleflow/__init__.py
@@ -22,6 +23,7 @@ scaleflow/training/dataset.py
 scaleflow/training/flow_matching.py
 scaleflow/training/losses.py
 scaleflow/training/trainer.py
+tests/test_integration.py
 tests/test_models.py
 tests/test_pipeline.py
 tests/test_tokenizer.py
