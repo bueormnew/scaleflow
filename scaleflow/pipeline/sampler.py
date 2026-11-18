@@ -54,9 +54,12 @@ class MultiscaleFlowSampler:
         text_mask: Optional[torch.Tensor] = None,
         negative_text_mask: Optional[torch.Tensor] = None,
         guidance_scale: float = 1.0,
-        ode_steps: int = 1,
+        ode_steps: int = 4,
+        upsample_to_next: bool = True,
+        noise_sigma: float = 0.5,
+        generator: Optional[torch.Generator] = None,
     ) -> torch.Tensor:
-        """Perform recursive upsampling and ODE flow transition from scale s to s+1.
+        """Perform ODE flow integration at scale s, and optionally upsample to s+1.
         
         Args:
             x: Image/state tensor at current scale (B, C, H, W).
@@ -68,47 +71,25 @@ class MultiscaleFlowSampler:
             text_mask: Optional text padding mask (B, L).
             negative_text_mask: Optional unconditional text padding mask (B, L).
             guidance_scale: Classifier-free guidance weight (>= 1.0).
-            ode_steps: Number of Euler ODE sub-steps (default: 1).
+            ode_steps: Number of Euler ODE sub-steps (default: 4).
+            upsample_to_next: Whether to upsample to 2x resolution for next scale.
+            noise_sigma: Noise fraction blended on upsampling (matches training).
+            generator: Optional PyTorch random generator.
             
         Returns:
-            Output image tensor at 2x resolution (B, C, 2H, 2W).
+            Image tensor at current resolution (if upsample_to_next=False)
+            or at 2x resolution (if upsample_to_next=True).
         """
         device = x.device
         dtype = x.dtype
         batch_size = x.shape[0]
 
-        # Case 1: Direct 1-step recursive flow transition (most efficient, standard ScaleFlow)
-        if ode_steps <= 1:
-            if guidance_scale > 1.0 and negative_prompt_embeds is not None:
-                out_cond = self.model.recursive_step(
-                    x,
-                    current_scale=scale,
-                    e_text=prompt_embeds,
-                    text_sequence=text_sequence,
-                    text_mask=text_mask,
-                )
-                out_uncond = self.model.recursive_step(
-                    x,
-                    current_scale=scale,
-                    e_text=negative_prompt_embeds,
-                    text_sequence=negative_text_sequence,
-                    text_mask=negative_text_mask,
-                )
-                next_x = out_uncond + guidance_scale * (out_cond - out_uncond)
-            else:
-                next_x = self.model.recursive_step(
-                    x,
-                    current_scale=scale,
-                    e_text=prompt_embeds,
-                    text_sequence=text_sequence,
-                    text_mask=text_mask,
-                )
-            return torch.clamp(next_x, -1.0, 1.0)
-
-        # Case 2: Multi-step Euler ODE integration within current scale, then upsample
-        dt = 1.0 / ode_steps
+        # 1. Integrate flow matching ODE at current scale using TRAINED direct_head velocity field
+        num_steps = max(1, ode_steps)
+        dt = 1.0 / num_steps
         curr = x
-        for step in range(ode_steps):
+
+        for step in range(num_steps):
             e_scale = self.model.embed_scale(scale, device=device).to(dtype=dtype)
             if guidance_scale > 1.0 and negative_prompt_embeds is not None:
                 v_cond = self.model.decoder(
@@ -141,34 +122,19 @@ class MultiscaleFlowSampler:
                     upsample=False,
                 )
 
-            # Euler integration step
             curr = curr + dt * v
 
-        # Finally, recursive step to next scale
-        if guidance_scale > 1.0 and negative_prompt_embeds is not None:
-            out_cond = self.model.recursive_step(
-                curr,
-                current_scale=scale,
-                e_text=prompt_embeds,
-                text_sequence=text_sequence,
-                text_mask=text_mask,
-            )
-            out_uncond = self.model.recursive_step(
-                curr,
-                current_scale=scale,
-                e_text=negative_prompt_embeds,
-                text_sequence=negative_text_sequence,
-                text_mask=negative_text_mask,
-            )
-            next_x = out_uncond + guidance_scale * (out_cond - out_uncond)
+        # 2. If not upsampling, clamp and return clean image at current scale
+        if not upsample_to_next:
+            return torch.clamp(curr, -1.0, 1.0)
+
+        # 3. Bilinear upsample to 2x resolution and blend scale transition noise
+        curr_up = F.interpolate(curr, scale_factor=2.0, mode="bilinear", align_corners=False)
+        if noise_sigma > 0.0:
+            noise = torch.randn(curr_up.shape, generator=generator, device=device, dtype=dtype)
+            next_x = (1.0 - noise_sigma) * curr_up + noise_sigma * noise
         else:
-            next_x = self.model.recursive_step(
-                curr,
-                current_scale=scale,
-                e_text=prompt_embeds,
-                text_sequence=text_sequence,
-                text_mask=text_mask,
-            )
+            next_x = curr_up
 
         return torch.clamp(next_x, -1.0, 1.0)
 
@@ -256,6 +222,7 @@ class MultiscaleFlowSampler:
                 negative_text_mask=negative_text_mask,
                 guidance_scale=guidance_scale,
                 ode_steps=ode_steps_per_scale,
+                generator=generator,
             )
             pyramid.append(curr)
 
